@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>几何变形画板</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    min-height: 100vh;
+    background: #f0efe9;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-family: Georgia, serif;
+  }
+  h1 {
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: 0.35em;
+    color: #aaa;
+    margin-bottom: 14px;
+    text-transform: uppercase;
+  }
+  #wrap { border: 1px solid #ddd; box-shadow: 0 4px 32px rgba(0,0,0,0.07); }
+  canvas {
+    display: block;
+    background: #fff;
+    cursor: crosshair;
+    touch-action: none;
+    max-width: 95vw;
+  }
+  #controls { margin-top: 14px; display: flex; gap: 24px; align-items: center; }
+  #controls span { font-size: 11px; color: #bbb; letter-spacing: 0.12em; }
+  #clearBtn {
+    background: none; border: 1px solid #ccc; color: #999;
+    padding: 6px 22px; font-size: 11px; letter-spacing: 0.2em;
+    cursor: pointer; font-family: inherit; transition: border-color 0.2s, color 0.2s;
+  }
+  #clearBtn:hover { border-color: #333; color: #333; }
+</style>
+</head>
+<body>
+<h1>几何变形画板</h1>
+<div id="wrap">
+  <canvas id="canvas" width="700" height="520"></canvas>
+</div>
+<div id="controls">
+  <span>随意画线 · 松手后平滑变形</span>
+  <button id="clearBtn">清空</button>
+</div>
+<script>
+const N = 240;
+
+function sampleShape(cx, cy, R) {
+  const pts = [];
+  const lineLen = 4 * R;
+  const perArc = 60;
+  const perLine = 60;
+  for (let i = 0; i <= perArc; i++) {
+    const t = Math.PI + (Math.PI * i) / perArc;
+    pts.push({ x: cx + R * Math.cos(t), y: cy + R * Math.sin(t) });
+  }
+  for (let i = 1; i <= perLine; i++) {
+    pts.push({ x: cx + R, y: cy + (lineLen * i) / perLine });
+  }
+  for (let i = 1; i <= perArc; i++) {
+    const t = -Math.PI / 2 + (Math.PI * i) / perArc;
+    pts.push({ x: (cx + R) + R * Math.cos(t), y: (cy + lineLen + R) + R * Math.sin(t) });
+  }
+  for (let i = 1; i <= perArc; i++) {
+    const t = Math.PI / 2 + (Math.PI * i) / perArc;
+    pts.push({ x: (cx - R) + R * Math.cos(t), y: (cy + lineLen + R) + R * Math.sin(t) });
+  }
+  for (let i = 1; i <= perLine; i++) {
+    pts.push({ x: cx - R, y: cy + lineLen - (lineLen * i) / perLine });
+  }
+  return pts;
+}
+
+function resample(pts, n) {
+  if (pts.length === 0) return [];
+  if (pts.length === 1) return Array(n).fill({ ...pts[0] });
+  const dists = [0];
+  for (let i = 1; i < pts.length; i++) {
+    const dx = pts[i].x - pts[i-1].x, dy = pts[i].y - pts[i-1].y;
+    dists.push(dists[i-1] + Math.sqrt(dx*dx + dy*dy));
+  }
+  const total = dists[dists.length - 1];
+  if (total === 0) return Array(n).fill({ ...pts[0] });
+  const result = [];
+  for (let i = 0; i < n; i++) {
+    const target = (i / (n - 1)) * total;
+    let lo = 0, hi = dists.length - 1;
+    while (lo < hi - 1) {
+      const mid = (lo + hi) >> 1;
+      if (dists[mid] <= target) lo = mid; else hi = mid;
+    }
+    const seg = dists[hi] - dists[lo];
+    const t = seg < 1e-9 ? 0 : (target - dists[lo]) / seg;
+    result.push({
+      x: pts[lo].x + t * (pts[hi].x - pts[lo].x),
+      y: pts[lo].y + t * (pts[hi].y - pts[lo].y),
+    });
+  }
+  return result;
+}
+
+function easeInOut(t) { return t < 0.5 ? 2*t*t : -1 + (4 - 2*t)*t; }
+
+function drawPolyline(ctx, pts, color, width, dash) {
+  if (!pts || pts.length < 2) return;
+  ctx.save();
+  ctx.strokeStyle = color; ctx.lineWidth = width;
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  if (dash) ctx.setLineDash(dash);
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawGrid(ctx, w, h) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(0,0,0,0.05)"; ctx.lineWidth = 1;
+  for (let x = 0; x <= w; x += 40) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
+  for (let y = 0; y <= h; y += 40) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+  ctx.restore();
+}
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const state = { drawing: false, stroke: [], current: null, shapes: [], raf: null };
+
+function getXY(e) {
+  const r = canvas.getBoundingClientRect();
+  const sx = canvas.width / r.width, sy = canvas.height / r.height;
+  const src = e.touches ? e.touches[0] : e;
+  return { x: (src.clientX - r.left) * sx, y: (src.clientY - r.top) * sy };
+}
+
+function render() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawGrid(ctx, canvas.width, canvas.height);
+  for (const pts of state.shapes) drawPolyline(ctx, pts, "#1a1a2e", 4);
+  if (state.drawing && state.stroke.length > 1) drawPolyline(ctx, state.stroke, "#aab", 2.5, [6,8]);
+  if (state.current && state.current.length > 1) drawPolyline(ctx, state.current, "#1a1a2e", 4);
+}
+
+function morphTo(fromPts, toPts) {
+  if (state.raf) cancelAnimationFrame(state.raf);
+  const from = resample(fromPts, N);
+  const to = resample(toPts, N);
+  const start = performance.now();
+  const dur = 900;
+  function frame(now) {
+    const raw = Math.min((now - start) / dur, 1);
+    const t = easeInOut(raw);
+    state.current = from.map((p, i) => ({
+      x: p.x + (to[i].x - p.x) * t,
+      y: p.y + (to[i].y - p.y) * t,
+    }));
+    render();
+    if (raw < 1) { state.raf = requestAnimationFrame(frame); }
+    else { state.shapes.push(to); state.current = null; state.raf = null; render(); }
+  }
+  state.raf = requestAnimationFrame(frame);
+}
+
+function onDown(e) {
+  e.preventDefault();
+  if (state.raf) return;
+  state.drawing = true;
+  state.stroke = [getXY(e)];
+}
+function onMove(e) {
+  e.preventDefault();
+  if (!state.drawing) return;
+  state.stroke.push(getXY(e));
+  render();
+}
+function onUp(e) {
+  e.preventDefault();
+  if (!state.drawing) return;
+  state.drawing = false;
+  if (state.stroke.length < 3) { state.stroke = []; render(); return; }
+  let minX=Infinity, maxX=-Infinity, minY=Infinity, maxY=-Infinity;
+  for (const p of state.stroke) {
+    if (p.x<minX) minX=p.x; if (p.x>maxX) maxX=p.x;
+    if (p.y<minY) minY=p.y; if (p.y>maxY) maxY=p.y;
+  }
+  const cx = (minX+maxX)/2;
+  const R = Math.max(Math.max(maxX-minX, maxY-minY) / 4.5, 22);
+  const shapeCy = (minY+maxY)/2 - 2.5*R;
+  const fromStroke = state.stroke.slice();
+  state.stroke = [];
+  morphTo(fromStroke, sampleShape(cx, shapeCy, R));
+}
+
+canvas.addEventListener("mousedown", onDown);
+canvas.addEventListener("mousemove", onMove);
+canvas.addEventListener("mouseup", onUp);
+canvas.addEventListener("mouseleave", onUp);
+canvas.addEventListener("touchstart", onDown, { passive: false });
+canvas.addEventListener("touchmove", onMove, { passive: false });
+canvas.addEventListener("touchend", onUp, { passive: false });
+
+document.getElementById("clearBtn").addEventListener("click", () => {
+  if (state.raf) { cancelAnimationFrame(state.raf); state.raf = null; }
+  state.shapes = []; state.stroke = []; state.current = null;
+  render();
+});
+
+render();
+</script>
+</body>
+</html>
